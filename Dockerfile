@@ -24,11 +24,20 @@ RUN pip install uv
 # Install Python dependencies using uv
 RUN uv pip install --system -r pyproject.toml
 
+# Create a non-root user
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
 # Copy application code
 COPY streamlit_app.py utils.py ./
 
 # Create projects directory for output
 RUN mkdir -p /app/projects
+
+# Change ownership of the app directory to the non-root user
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
 
 # Expose Streamlit port
 EXPOSE 8501
