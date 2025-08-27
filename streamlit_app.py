@@ -14,6 +14,7 @@ from utils import (
     get_transcription_result,
     convert_transcript_to_spec,
     create_project_folder,
+    upload_requirements_to_s3,
     generate_unique_filename,
     process_audio_input
 )
@@ -66,6 +67,24 @@ def main():
     
     # Main header with proper spacing
     st.title("🎤 Audio Transcription to Kiro Spec")
+    
+    # Show S3 bucket name at the top
+    bucket_name = os.getenv('S3_BUCKET_NAME')
+    if bucket_name:
+        st.info(f"📦 **S3 Bucket:** `{bucket_name}`")
+    else:
+        st.warning("⚠️ **S3 Bucket:** Not configured (set S3_BUCKET_NAME environment variable)")
+    
+    # Model ID input section
+    st.subheader("🤖 Model ID")
+    
+    # Model ID text input with default value
+    selected_model_id = st.text_input(
+        "Bedrock Model ID:",
+        value="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        help="Enter the Bedrock model ID to use for converting your transcript into structured requirements."
+    )
+    
     st.markdown("---")
     
     # Description section
@@ -325,54 +344,95 @@ def main():
         
         **📄 Files Created:**
         - `{st.session_state.project_name}/requirements.md` - Your structured requirements document
-        
-        **📍 Location:** Current directory (`{os.getcwd()}`)
         """)
         
-        # Action buttons for next steps
-        col1, col2, col3 = st.columns([1, 2, 1])
+        # Action buttons for downloads and next steps
+        col1, col2, col3 = st.columns(3)
         
+        # Download Specs button
+        with col1:
+            try:
+                requirements_path = os.path.join(os.getcwd(), "projects", st.session_state.project_name, "requirements.md")
+                if os.path.exists(requirements_path):
+                    with open(requirements_path, 'r', encoding='utf-8') as f:
+                        spec_content = f.read()
+                    
+                    st.download_button(
+                        label="📄 Download Specs",
+                        data=spec_content,
+                        file_name=f"{st.session_state.project_name}_requirements.md",
+                        mime="text/markdown",
+                        help="Download the generated requirements document",
+                        use_container_width=True
+                    )
+                else:
+                    st.button("📄 Download Specs", disabled=True, help="Requirements file not found", use_container_width=True)
+            except Exception as e:
+                st.button("📄 Download Specs", disabled=True, help=f"Error: {str(e)}", use_container_width=True)
+        
+        # Download Transcript button
         with col2:
-            if st.button("🔄 Create Another Project", help="Start over with a new recording", use_container_width=True):
+            if st.session_state.transcription_text:
+                st.download_button(
+                    label="📝 Download Transcript",
+                    data=st.session_state.transcription_text,
+                    file_name=f"{st.session_state.project_name}_transcript.txt",
+                    mime="text/plain",
+                    help="Download the audio transcription text",
+                    use_container_width=True
+                )
+            else:
+                st.button("📝 Download Transcript", disabled=True, help="No transcript available", use_container_width=True)
+        
+        # Create Another Project button
+        with col3:
+            if st.button("🔄 New Project", help="Start over with a new recording", use_container_width=True):
                 reset_session_state()
                 st.rerun()
         
-        # Additional helpful information
-        with st.expander("📋 Next Steps", expanded=False):
-            st.markdown(f"""
-            **What's been created:**
-            1. A new project folder named `{st.session_state.project_name}`
-            2. A `requirements.md` file with your structured requirements in Kiro format
+        # Additional helpful information - only show on localhost
+        try:
+            # Check if running on localhost
+            import streamlit.web.server.server as server
+            is_localhost = False
             
-            **Recommended next steps:**
-            1. Review the generated requirements document
-            2. Use Kiro to create a design document from these requirements
-            3. Generate implementation tasks and start coding
-            4. Iterate and refine as needed
-            
-            **File Location:**
-            ```
-            {os.getcwd()}/
-            └── {st.session_state.project_name}/
-                └── requirements.md
-            ```
-            """)
-        
-        # Show a preview of the generated content
-        if st.button("👀 Preview Generated Requirements", help="View the content that was generated"):
+            # Try to get the server instance and check if it's localhost
             try:
-                requirements_path = os.path.join(os.getcwd(), st.session_state.project_name, "requirements.md")
-                if os.path.exists(requirements_path):
-                    with open(requirements_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    
-                    st.markdown("### 📄 Generated Requirements Preview")
-                    with st.expander("View requirements.md content", expanded=True):
-                        st.markdown(content)
+                # Get the current session info
+                session_info = st.runtime.get_instance()._session_mgr.list_sessions()
+                if session_info:
+                    # Check if any session is running on localhost
+                    is_localhost = any('localhost' in str(session) or '127.0.0.1' in str(session) for session in session_info)
                 else:
-                    st.error("Requirements file not found. There may have been an issue with file creation.")
-            except Exception as e:
-                st.error(f"Error reading requirements file: {str(e)}")
+                    # Fallback: check environment or assume localhost for development
+                    is_localhost = os.getenv('STREAMLIT_SERVER_ADDRESS', 'localhost') in ['localhost', '127.0.0.1']
+            except:
+                # Fallback: check if we're in a development environment
+                is_localhost = os.getenv('STREAMLIT_SERVER_ADDRESS', 'localhost') in ['localhost', '127.0.0.1']
+            
+            if is_localhost:
+                with st.expander("📋 Next Steps", expanded=False):
+                    st.markdown(f"""
+                    **What's been created:**
+                    1. A new project folder named `{st.session_state.project_name}`
+                    2. A `requirements.md` file with your structured requirements in Kiro format
+                    
+                    **Recommended next steps:**
+                    1. Review the generated requirements document
+                    2. Use Kiro to create a design document from these requirements
+                    3. Generate implementation tasks and start coding
+                    4. Iterate and refine as needed
+                    
+                    **File Location:**
+                    ```
+                    {os.getcwd()}/
+                    └── {st.session_state.project_name}/
+                        └── requirements.md
+                    ```
+                    """)
+        except Exception:
+            # If we can't determine the host, don't show the next steps section
+            pass
     
     # Processing workflow - orchestrate the complete audio-to-spec pipeline
     if submit_button and audio_data is not None:
@@ -446,11 +506,15 @@ def main():
             with st.spinner("Generating Kiro specification..."):
                 st.info("✨ **Step 3/3:** Creating structured requirements document")
                 
-                spec_content, project_name = convert_transcript_to_spec(transcription_text)
+                spec_content, project_name = convert_transcript_to_spec(transcription_text, selected_model_id)
                 st.session_state.project_name = project_name
                 
                 # Step 4: Create local project folder and save requirements.md
                 create_project_folder(project_name, spec_content)
+                
+                # Step 5: Upload requirements.md to S3
+                s3_requirements_uri = upload_requirements_to_s3(bucket_name, project_name, spec_content)
+                st.write(f"✅ Requirements uploaded to S3: {s3_requirements_uri}")
             
             # Mark as complete
             st.session_state.processing_status = 'complete'
@@ -470,7 +534,7 @@ def main():
     st.markdown("---")
     st.markdown(
         "<div style='text-align: center; color: #666;'>"
-        "Powered by Amazon Transcribe & Bedrock Claude 3.7"
+        "Powered by Amazon Transcribe & Bedrock Claude Models"
         "</div>",
         unsafe_allow_html=True
     )

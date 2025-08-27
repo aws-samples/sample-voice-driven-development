@@ -454,12 +454,13 @@ def get_transcription_result(job_name: str) -> str:
         raise Exception(f"Unexpected error retrieving transcription result: {str(e)}")
 
 
-def convert_transcript_to_spec(transcript: str) -> Tuple[str, str]:
+def convert_transcript_to_spec(transcript: str, model_id: str = "us.anthropic.claude-3-5-sonnet-20241022-v2:0") -> Tuple[str, str]:
     """
-    Use Bedrock Claude 3.7 to convert transcript to Kiro spec format
+    Use Bedrock Claude to convert transcript to Kiro spec format
     
     Args:
         transcript: Transcribed text
+        model_id: Bedrock model ID to use (defaults to Claude 3.5 Sonnet v2)
         
     Returns:
         Tuple of (specification_content, project_name)
@@ -472,12 +473,18 @@ def convert_transcript_to_spec(transcript: str) -> Tuple[str, str]:
     if not transcript or not transcript.strip():
         raise ValueError("Transcript cannot be empty")
     
-    try:
-        # Initialize Bedrock Runtime client with hardcoded region
-        bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
-        
-        # Create prompt template for converting transcript to Kiro spec format
-        prompt_template = """You are an expert software requirements analyst. Your task is to convert the following spoken requirements transcript into a detailed Kiro specs-driven development format.
+    # Retry configuration
+    max_retries = 3
+    base_delay = 1  # Base delay in seconds
+    max_delay = 30  # Maximum delay in seconds
+    
+    for attempt in range(max_retries + 1):
+        try:
+            # Initialize Bedrock Runtime client with hardcoded region
+            bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
+            
+            # Create prompt template for converting transcript to Kiro spec format
+            prompt_template = """You are an expert software requirements analyst. Your task is to convert the following spoken requirements transcript into a detailed Kiro specs-driven development format.
 
 Please analyze the transcript and create:
 1. A comprehensive requirements document in markdown format following Kiro specifications
@@ -501,111 +508,222 @@ Please respond in the following JSON format:
 
 Ensure the project name is descriptive, uses kebab-case, and reflects the main purpose of the project described in the transcript."""
 
-        # Format the prompt with the transcript
-        formatted_prompt = prompt_template.format(transcript=transcript)
-        
-        # Prepare the request for Bedrock converse API
-        request_body = {
-            "modelId": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{"text": formatted_prompt}]
+            # Format the prompt with the transcript
+            formatted_prompt = prompt_template.format(transcript=transcript)
+            
+            # Prepare the request for Bedrock converse API
+            request_body = {
+                "modelId": model_id,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"text": formatted_prompt}]
+                    }
+                ],
+                "inferenceConfig": {
+                    "maxTokens": 4000,
+                    "temperature": 0.1
                 }
-            ],
-            "inferenceConfig": {
-                "maxTokens": 4000,
-                "temperature": 0.1
             }
-        }
+            
+            print(f"DEBUG: Bedrock API call attempt {attempt + 1}/{max_retries + 1}")
+            
+            # Call Bedrock converse API
+            response = bedrock_client.converse(**request_body)
+            
+            # Extract the response content
+            if 'output' not in response or 'message' not in response['output']:
+                raise ValueError("Invalid response structure from Bedrock API")
+            
+            message_content = response['output']['message']['content']
+            if not message_content or len(message_content) == 0:
+                raise ValueError("Empty response content from Bedrock API")
+            
+            # Get the text content from the response
+            response_text = message_content[0]['text']
+            print(f"DEBUG: Bedrock response text: {response_text[:200]}...")
+            
+            # Parse the JSON response to extract specification content and project name
+            try:
+                # Find JSON content in the response (handle cases where model adds extra text)
+                json_start = response_text.find('{')
+                json_end = response_text.rfind('}') + 1
+                
+                if json_start == -1 or json_end == 0:
+                    raise ValueError("No JSON content found in Bedrock response")
+                
+                json_content = response_text[json_start:json_end]
+                parsed_response = json.loads(json_content)
+                
+                # Validate required fields
+                if 'project_name' not in parsed_response:
+                    raise ValueError("Missing 'project_name' in Bedrock response")
+                if 'specification_content' not in parsed_response:
+                    raise ValueError("Missing 'specification_content' in Bedrock response")
+                
+                project_name = parsed_response['project_name'].strip()
+                specification_content = parsed_response['specification_content'].strip()
+                
+                # Validate project name format (kebab-case)
+                if not project_name or not all(c.islower() or c.isdigit() or c == '-' for c in project_name):
+                    raise ValueError(f"Invalid project name format: '{project_name}'. Must be kebab-case.")
+                
+                # Validate specification content is not empty
+                if not specification_content:
+                    raise ValueError("Specification content cannot be empty")
+                
+                print(f"DEBUG: Successfully parsed Bedrock response on attempt {attempt + 1}")
+                return specification_content, project_name
+                
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Failed to parse JSON response from Bedrock: {str(e)}")
+            
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            error_message = e.response['Error']['Message']
+            
+            # Check if this is a retryable error
+            retryable_errors = ['ThrottlingException', 'ServiceUnavailableException', 'InternalServerException']
+            
+            if error_code in retryable_errors and attempt < max_retries:
+                # Calculate exponential backoff delay
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                print(f"DEBUG: Retryable error {error_code} on attempt {attempt + 1}. Retrying in {delay} seconds...")
+                time.sleep(delay)
+                continue
+            
+            # Non-retryable errors or max retries exceeded
+            if error_code == 'AccessDeniedException':
+                raise ClientError(
+                    error_response={'Error': {'Code': error_code, 'Message': "Access denied to Amazon Bedrock. Check your AWS permissions and model access."}},
+                    operation_name='Converse'
+                )
+            elif error_code == 'ThrottlingException':
+                raise ClientError(
+                    error_response={'Error': {'Code': error_code, 'Message': "Bedrock API rate limit exceeded. Please try again later."}},
+                    operation_name='Converse'
+                )
+            elif error_code == 'ValidationException':
+                raise ClientError(
+                    error_response={'Error': {'Code': error_code, 'Message': f"Invalid request parameters for Bedrock API: {error_message}"}},
+                    operation_name='Converse'
+                )
+            elif error_code == 'ModelNotReadyException':
+                raise ClientError(
+                    error_response={'Error': {'Code': error_code, 'Message': "Claude 3.5 Sonnet model is not ready. Please try again later."}},
+                    operation_name='Converse'
+                )
+            elif error_code == 'ServiceQuotaExceededException':
+                raise ClientError(
+                    error_response={'Error': {'Code': error_code, 'Message': "Bedrock service quota exceeded. Please check your usage limits."}},
+                    operation_name='Converse'
+                )
+            else:
+                raise ClientError(
+                    error_response={'Error': {'Code': error_code, 'Message': f"Bedrock API call failed: {error_message}"}},
+                    operation_name='Converse'
+                )
         
-        # Call Bedrock converse API
-        response = bedrock_client.converse(**request_body)
+        except ValueError as e:
+            # For JSON parsing errors, retry if we haven't exceeded max attempts
+            if "No JSON content found" in str(e) and attempt < max_retries:
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                print(f"DEBUG: JSON parsing error on attempt {attempt + 1}. Retrying in {delay} seconds...")
+                time.sleep(delay)
+                continue
+            else:
+                # Re-raise ValueError if not retryable or max retries exceeded
+                raise
         
-        # Extract the response content
-        if 'output' not in response or 'message' not in response['output']:
-            raise ValueError("Invalid response structure from Bedrock API")
+        except Exception as e:
+            # For unexpected errors, retry if we haven't exceeded max attempts
+            if attempt < max_retries:
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                print(f"DEBUG: Unexpected error on attempt {attempt + 1}: {str(e)}. Retrying in {delay} seconds...")
+                time.sleep(delay)
+                continue
+            else:
+                raise Exception(f"Unexpected error calling Bedrock API after {max_retries + 1} attempts: {str(e)}")
+    
+    # This should never be reached, but just in case
+    raise Exception(f"Failed to get valid response from Bedrock API after {max_retries + 1} attempts")
+
+
+def upload_requirements_to_s3(bucket_name: str, project_name: str, requirements_content: str) -> str:
+    """
+    Upload requirements.md file to S3 following project/name/requirement structure
+    
+    Args:
+        bucket_name: S3 bucket name
+        project_name: Name of the project (used in S3 key path)
+        requirements_content: Content of the requirements.md file
         
-        message_content = response['output']['message']['content']
-        if not message_content or len(message_content) == 0:
-            raise ValueError("Empty response content from Bedrock API")
+    Returns:
+        S3 URI of the uploaded requirements file
         
-        # Get the text content from the response
-        response_text = message_content[0]['text']
+    Raises:
+        ClientError: If S3 operation fails
+        ValueError: If required parameters are missing or invalid
+    """
+    if not bucket_name:
+        raise ValueError("Bucket name cannot be empty")
+    if not project_name:
+        raise ValueError("Project name cannot be empty")
+    if not requirements_content:
+        raise ValueError("Requirements content cannot be empty")
+    
+    try:
+        # Initialize S3 client with timeout configuration and hardcoded region
+        s3_client = boto3.client(
+            's3',
+            region_name='us-east-1',
+            config=boto3.session.Config(
+                connect_timeout=60,
+                read_timeout=60,
+                retries={'max_attempts': 3}
+            )
+        )
         
-        # Parse the JSON response to extract specification content and project name
-        try:
-            # Find JSON content in the response (handle cases where model adds extra text)
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
-            
-            if json_start == -1 or json_end == 0:
-                raise ValueError("No JSON content found in Bedrock response")
-            
-            json_content = response_text[json_start:json_end]
-            parsed_response = json.loads(json_content)
-            
-            # Validate required fields
-            if 'project_name' not in parsed_response:
-                raise ValueError("Missing 'project_name' in Bedrock response")
-            if 'specification_content' not in parsed_response:
-                raise ValueError("Missing 'specification_content' in Bedrock response")
-            
-            project_name = parsed_response['project_name'].strip()
-            specification_content = parsed_response['specification_content'].strip()
-            
-            # Validate project name format (kebab-case)
-            if not project_name or not all(c.islower() or c.isdigit() or c == '-' for c in project_name):
-                raise ValueError(f"Invalid project name format: '{project_name}'. Must be kebab-case.")
-            
-            # Validate specification content is not empty
-            if not specification_content:
-                raise ValueError("Specification content cannot be empty")
-            
-            return specification_content, project_name
-            
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse JSON response from Bedrock: {str(e)}")
+        # Create S3 key following project/name/requirement structure
+        s3_key = f"projects/{project_name}/requirements.md"
+        
+        print(f"DEBUG: Starting S3 requirements upload - bucket: {bucket_name}, key: {s3_key}")
+        
+        # Upload the requirements file to S3
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=s3_key,
+            Body=requirements_content.encode('utf-8'),
+            ContentType='text/markdown'
+        )
+        
+        print(f"DEBUG: S3 requirements upload completed successfully")
+        
+        # Return the S3 URI
+        s3_uri = f"s3://{bucket_name}/{s3_key}"
+        return s3_uri
         
     except ClientError as e:
         error_code = e.response['Error']['Code']
         error_message = e.response['Error']['Message']
         
-        if error_code == 'AccessDeniedException':
+        if error_code == 'NoSuchBucket':
             raise ClientError(
-                error_response={'Error': {'Code': error_code, 'Message': "Access denied to Amazon Bedrock. Check your AWS permissions and model access."}},
-                operation_name='Converse'
+                error_response={'Error': {'Code': error_code, 'Message': f"S3 bucket '{bucket_name}' does not exist"}},
+                operation_name='PutObject'
             )
-        elif error_code == 'ThrottlingException':
+        elif error_code == 'AccessDenied':
             raise ClientError(
-                error_response={'Error': {'Code': error_code, 'Message': "Bedrock API rate limit exceeded. Please try again later."}},
-                operation_name='Converse'
-            )
-        elif error_code == 'ValidationException':
-            raise ClientError(
-                error_response={'Error': {'Code': error_code, 'Message': f"Invalid request parameters for Bedrock API: {error_message}"}},
-                operation_name='Converse'
-            )
-        elif error_code == 'ModelNotReadyException':
-            raise ClientError(
-                error_response={'Error': {'Code': error_code, 'Message': "Claude 3.5 Sonnet model is not ready. Please try again later."}},
-                operation_name='Converse'
-            )
-        elif error_code == 'ServiceQuotaExceededException':
-            raise ClientError(
-                error_response={'Error': {'Code': error_code, 'Message': "Bedrock service quota exceeded. Please check your usage limits."}},
-                operation_name='Converse'
+                error_response={'Error': {'Code': error_code, 'Message': f"Access denied to S3 bucket '{bucket_name}'. Check your AWS permissions."}},
+                operation_name='PutObject'
             )
         else:
             raise ClientError(
-                error_response={'Error': {'Code': error_code, 'Message': f"Bedrock API call failed: {error_message}"}},
-                operation_name='Converse'
+                error_response={'Error': {'Code': error_code, 'Message': f"S3 requirements upload failed: {error_message}"}},
+                operation_name='PutObject'
             )
-    except ValueError:
-        # Re-raise ValueError as-is
-        raise
     except Exception as e:
-        raise Exception(f"Unexpected error calling Bedrock API: {str(e)}")
+        raise Exception(f"Unexpected error during S3 requirements upload: {str(e)}")
 
 
 def create_project_folder(project_name: str, spec_content: str) -> bool:
