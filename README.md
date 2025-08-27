@@ -20,6 +20,19 @@ A Streamlit application that captures audio input from your browser microphone o
 - **Amazon Transcribe**: For speech-to-text conversion
 - **Amazon Bedrock**: For Claude 3.5 Sonnet access
 
+### Bedrock Model Access
+
+Before using this application, you must request access to Claude models in Amazon Bedrock:
+
+1. Navigate to the [Amazon Bedrock Console](https://console.aws.amazon.com/bedrock/)
+2. Go to "Model access" in the left sidebar
+3. Click "Request model access"
+4. Update the model ID you want to use: **Claude 3.5 Sonnet v2** is set as default.
+5. Submit your access request
+6. Wait for approval (usually takes a few minutes)
+
+Note: Model availability varies by AWS region. This application uses `us-east-1` by default.
+
 ### AWS Permissions Required
 
 Your AWS credentials need the following permissions:
@@ -44,7 +57,9 @@ Your AWS credentials need the following permissions:
     {
       "Effect": "Allow",
       "Action": ["bedrock:InvokeModel"],
-      "Resource": "arn:aws:bedrock:us-east-1::foundation-model/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+      "Resource": [
+        "arn:aws:bedrock:us-east-1::foundation-model/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+      ]
     }
   ]
 }
@@ -93,32 +108,16 @@ uv sync
 #### 4. Configure Environment Variables
 
 ```bash
-# Copy environment template
-cp .env.example .env
-
-# Edit .env file with your AWS credentials
-nano .env  # or use your preferred editor
-```
-
-Add your AWS credentials to `.env`:
-
-```bash
-AWS_ACCESS_KEY_ID=your_access_key_here
-AWS_SECRET_ACCESS_KEY=your_secret_key_here
-AWS_SESSION_TOKEN=your_session_token_here_if_using_temporary_credentials
-S3_BUCKET_NAME=your-s3-bucket-name
+# Set your AWS credentials
+export AWS_ACCESS_KEY_ID=your_access_key_here
+export AWS_SECRET_ACCESS_KEY=your_secret_key_here
+export AWS_SESSION_TOKEN=your_session_token_here_if_using_temporary_credentials  # Optional
+export S3_BUCKET_NAME=your-s3-bucket-name
 ```
 
 #### 5. Run the Application
 
 ```bash
-# Load environment variables and run
-source .env && streamlit run streamlit_app.py
-
-# Or export variables manually
-export AWS_ACCESS_KEY_ID=your_access_key
-export AWS_SECRET_ACCESS_KEY=your_secret_key
-export S3_BUCKET_NAME=your-bucket-name
 streamlit run streamlit_app.py
 ```
 
@@ -178,7 +177,7 @@ sample-voice-driven-development/
 ├── utils.py                  # AWS service utilities
 ├── pyproject.toml           # Python dependencies
 ├── Dockerfile               # Docker configuration
-├── .env.example            # Environment variables template
+
 ├── .dockerignore           # Docker build exclusions
 ├── README.md               # This file
 └── projects/               # Generated project folders
