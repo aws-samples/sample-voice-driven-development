@@ -4,6 +4,8 @@ Convert spoken requirements into structured Kiro specifications using AI transcr
 
 This Streamlit application captures audio input (microphone or file upload), transcribes it using Amazon Transcribe, and generates structured requirements documents using Amazon Bedrock Claude 3.5 Sonnet.
 
+> 🤖 **Fun fact:** This entire project was created using [Kiro](https://kiro.ai), an AI-powered development assistant that helped design, implement, and document the application from initial concept to deployment.
+
 ## Features
 
 - 🎤 Browser microphone recording or .wav file upload
