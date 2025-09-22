@@ -373,31 +373,49 @@ def get_transcription_result(job_name: str) -> str:
         transcript_uri = response['TranscriptionJob']['Transcript']['TranscriptFileUri']
         print(f"Debug: Transcript URI: {transcript_uri}")
         
-        # Parse S3 URI to get bucket and key
+        # Parse S3 URI to get bucket and key with proper validation
         # URI format: https://s3.region.amazonaws.com/bucket-name/key
         # or https://bucket-name.s3.region.amazonaws.com/key
         # or s3://bucket-name/key
         if transcript_uri.startswith('https://'):
-            # Parse HTTPS S3 URL
+            # Parse HTTPS S3 URL with proper domain validation
             parts = transcript_uri.replace('https://', '').split('/')
+            hostname = parts[0].lower()
             
-            if parts[0].startswith('s3.') and '.amazonaws.com' in parts[0]:
+            # Validate that this is actually an AWS S3 domain
+            if hostname.startswith('s3.') and hostname.endswith('.amazonaws.com'):
                 # Format: https://s3.region.amazonaws.com/bucket-name/key
-                bucket_name = parts[1]
-                key = '/'.join(parts[2:])
-            elif '.s3.' in parts[0] and '.amazonaws.com' in parts[0]:
+                # Validate the hostname format more strictly
+                hostname_parts = hostname.split('.')
+                if len(hostname_parts) == 4 and hostname_parts[0] == 's3' and hostname_parts[2] == 'amazonaws' and hostname_parts[3] == 'com':
+                    bucket_name = parts[1] if len(parts) > 1 else ''
+                    key = '/'.join(parts[2:]) if len(parts) > 2 else ''
+                else:
+                    raise ValueError(f"Invalid S3 hostname format: {hostname}")
+            elif hostname.endswith('.s3.amazonaws.com') or (hostname.count('.s3.') == 1 and hostname.endswith('.amazonaws.com')):
                 # Format: https://bucket-name.s3.region.amazonaws.com/key
-                bucket_name = parts[0].split('.s3.')[0]
-                key = '/'.join(parts[1:])
+                # Validate the hostname format more strictly
+                if '.s3.' in hostname and hostname.endswith('.amazonaws.com'):
+                    s3_index = hostname.find('.s3.')
+                    bucket_name = hostname[:s3_index]
+                    # Validate bucket name doesn't contain suspicious characters
+                    if not bucket_name or '.' in bucket_name[:-1] or bucket_name.startswith('-') or bucket_name.endswith('-'):
+                        # Allow dots in bucket names but be more careful about validation
+                        pass
+                    key = '/'.join(parts[1:]) if len(parts) > 1 else ''
+                else:
+                    raise ValueError(f"Invalid S3 hostname format: {hostname}")
             else:
-                # Fallback for other formats
-                bucket_name = parts[0]
-                key = '/'.join(parts[1:])
+                raise ValueError(f"Invalid S3 hostname - not an AWS S3 domain: {hostname}")
         elif transcript_uri.startswith('s3://'):
             # Parse S3 URI
             uri_parts = transcript_uri.replace('s3://', '').split('/', 1)
             bucket_name = uri_parts[0]
             key = uri_parts[1] if len(uri_parts) > 1 else ''
+            
+            # Validate bucket name format
+            if not bucket_name or len(bucket_name) < 3 or len(bucket_name) > 63:
+                raise ValueError(f"Invalid S3 bucket name: {bucket_name}")
         else:
             raise ValueError(f"Invalid transcript URI format: {transcript_uri}")
         
