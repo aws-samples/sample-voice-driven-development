@@ -6,6 +6,11 @@ transcribes it using Amazon Transcribe, and converts the transcript into
 a Kiro specification format using Amazon Bedrock Claude 3.7.
 """
 
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import streamlit as st
 from utils import (
     upload_audio_to_s3,
@@ -13,6 +18,7 @@ from utils import (
     poll_transcription_status,
     get_transcription_result,
     convert_transcript_to_spec,
+    generate_tasks_from_spec,
     create_project_folder,
     upload_requirements_to_s3,
     generate_unique_filename,
@@ -81,7 +87,7 @@ def main():
     # Model ID text input with default value
     selected_model_id = st.text_input(
         "Bedrock Model ID:",
-        value="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        value=os.environ.get("BEDROCK_MODEL_ID", "eu.anthropic.claude-haiku-4-5-20251001-v1:0"),
         help="Enter the Bedrock model ID to use for converting your transcript into structured requirements."
     )
     
@@ -344,10 +350,11 @@ def main():
         
         **📄 Files Created:**
         - `{st.session_state.project_name}/requirements.md` - Your structured requirements document
+        - `{st.session_state.project_name}/tasks.md` - Implementation tasks for AI agents
         """)
         
         # Action buttons for downloads and next steps
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         
         # Download Specs button
         with col1:
@@ -370,8 +377,29 @@ def main():
             except Exception as e:
                 st.button("📄 Download Specs", disabled=True, help=f"Error: {str(e)}", use_container_width=True)
         
-        # Download Transcript button
+        # Download Tasks button
         with col2:
+            try:
+                tasks_path = os.path.join(os.getcwd(), "projects", st.session_state.project_name, "tasks.md")
+                if os.path.exists(tasks_path):
+                    with open(tasks_path, 'r', encoding='utf-8') as f:
+                        tasks_content = f.read()
+                    
+                    st.download_button(
+                        label="✅ Download Tasks",
+                        data=tasks_content,
+                        file_name=f"{st.session_state.project_name}_tasks.md",
+                        mime="text/markdown",
+                        help="Download the implementation tasks for AI agents",
+                        use_container_width=True
+                    )
+                else:
+                    st.button("✅ Download Tasks", disabled=True, help="Tasks file not found", use_container_width=True)
+            except Exception as e:
+                st.button("✅ Download Tasks", disabled=True, help=f"Error: {str(e)}", use_container_width=True)
+        
+        # Download Transcript button
+        with col3:
             if st.session_state.transcription_text:
                 st.download_button(
                     label="📝 Download Transcript",
@@ -385,7 +413,7 @@ def main():
                 st.button("📝 Download Transcript", disabled=True, help="No transcript available", use_container_width=True)
         
         # Create Another Project button
-        with col3:
+        with col4:
             if st.button("🔄 New Project", help="Start over with a new recording", use_container_width=True):
                 reset_session_state()
                 st.rerun()
@@ -509,8 +537,11 @@ def main():
                 spec_content, project_name = convert_transcript_to_spec(transcription_text, selected_model_id)
                 st.session_state.project_name = project_name
                 
-                # Step 4: Create local project folder and save requirements.md
-                create_project_folder(project_name, spec_content)
+                # Generate tasks from the spec
+                tasks_content = generate_tasks_from_spec(spec_content, selected_model_id)
+                
+                # Step 4: Create local project folder and save requirements.md and tasks.md
+                create_project_folder(project_name, spec_content, tasks_content)
                 
                 # Step 5: Upload requirements.md to S3
                 s3_requirements_uri = upload_requirements_to_s3(bucket_name, project_name, spec_content)

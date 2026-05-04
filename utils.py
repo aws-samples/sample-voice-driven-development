@@ -472,7 +472,7 @@ def get_transcription_result(job_name: str) -> str:
         raise Exception(f"Unexpected error retrieving transcription result: {str(e)}")
 
 
-def convert_transcript_to_spec(transcript: str, model_id: str = "us.anthropic.claude-3-5-sonnet-20241022-v2:0") -> Tuple[str, str]:
+def convert_transcript_to_spec(transcript: str, model_id: str = None) -> Tuple[str, str]:
     """
     Use Bedrock Claude to convert transcript to Kiro spec format
     
@@ -488,6 +488,9 @@ def convert_transcript_to_spec(transcript: str, model_id: str = "us.anthropic.cl
         ValueError: If transcript is empty or response is invalid
         Exception: For other unexpected errors
     """
+    if model_id is None:
+        model_id = os.environ.get("BEDROCK_MODEL_ID", "eu.anthropic.claude-haiku-4-5-20251001-v1:0")
+
     if not transcript or not transcript.strip():
         raise ValueError("Transcript cannot be empty")
     
@@ -667,6 +670,40 @@ Ensure the project name is descriptive, uses kebab-case, and reflects the main p
     raise Exception(f"Failed to get valid response from Bedrock API after {max_retries + 1} attempts")
 
 
+def generate_tasks_from_spec(spec_content: str, model_id: str = None) -> str:
+    """Generate tasks.md from requirements spec using Bedrock."""
+    if model_id is None:
+        model_id = os.environ.get("BEDROCK_MODEL_ID", "eu.anthropic.claude-haiku-4-5-20251001-v1:0")
+
+    if not spec_content or not spec_content.strip():
+        raise ValueError("Specification content cannot be empty")
+
+    bedrock_client = boto3.client('bedrock-runtime')
+
+    prompt = f"""You are an expert software engineer. Given the following requirements specification, generate a detailed tasks.md file that an AI coding agent can follow to implement the project and satisfy all acceptance criteria.
+
+For each requirement, create actionable implementation tasks with:
+- Clear task title
+- Step-by-step subtasks
+- Files to create or modify
+- Exit criteria that map back to the acceptance criteria
+
+Use markdown with checkboxes (- [ ]) so progress can be tracked.
+
+REQUIREMENTS:
+{spec_content}
+
+Respond with ONLY the markdown content for tasks.md, no JSON wrapping."""
+
+    response = bedrock_client.converse(
+        modelId=model_id,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": 4000, "temperature": 0.1}
+    )
+
+    return response['output']['message']['content'][0]['text'].strip()
+
+
 def upload_requirements_to_s3(bucket_name: str, project_name: str, requirements_content: str) -> str:
     """
     Upload requirements.md file to S3 following project/name/requirement structure
@@ -744,7 +781,7 @@ def upload_requirements_to_s3(bucket_name: str, project_name: str, requirements_
         raise Exception(f"Unexpected error during S3 requirements upload: {str(e)}")
 
 
-def create_project_folder(project_name: str, spec_content: str) -> bool:
+def create_project_folder(project_name: str, spec_content: str, tasks_content: str = None) -> bool:
     """
     Create local folder under 'projects' directory and save requirements.md file
     
@@ -815,6 +852,12 @@ def create_project_folder(project_name: str, spec_content: str) -> bool:
         file_size = os.path.getsize(requirements_file_path)
         if file_size == 0:
             raise OSError(f"Requirements.md file was created but is empty at {requirements_file_path}")
+        
+        # Write tasks.md if provided
+        if tasks_content and tasks_content.strip():
+            tasks_file_path = os.path.join(project_path, 'tasks.md')
+            with open(tasks_file_path, 'w', encoding='utf-8') as f:
+                f.write(tasks_content)
         
         return True
         
