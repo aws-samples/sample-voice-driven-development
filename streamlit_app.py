@@ -22,7 +22,12 @@ from utils import (
     create_project_folder,
     upload_requirements_to_s3,
     generate_unique_filename,
-    process_audio_input
+    process_audio_input,
+    convert_transcript_to_github_issue,
+    create_github_issue,
+    is_parakeet_available,
+    transcribe_with_parakeet,
+    PARAKEET_DEFAULT_MODEL,
 )
 import os
 
@@ -45,6 +50,14 @@ def initialize_session_state():
         st.session_state.input_method = None  # 'microphone' or 'upload'
     if 'selected_audio_data' not in st.session_state:
         st.session_state.selected_audio_data = None
+    if 'output_mode' not in st.session_state:
+        # Default to GitHub mode when a token is configured, otherwise local.
+        st.session_state.output_mode = 'github' if os.getenv('GITHUB_TOKEN') else 'local'
+    if 'transcription_engine' not in st.session_state:
+        # 'aws' = Amazon Transcribe, 'parakeet' = Parakeet MLX (local)
+        st.session_state.transcription_engine = 'aws'
+    if 'github_issue' not in st.session_state:
+        st.session_state.github_issue = None  # dict with number/html_url when created
 
 
 def reset_session_state():
@@ -57,6 +70,7 @@ def reset_session_state():
     st.session_state.transcription_progress = None
     st.session_state.input_method = None
     st.session_state.selected_audio_data = None
+    st.session_state.github_issue = None
 
 
 def main():
@@ -68,31 +82,123 @@ def main():
     st.set_page_config(
         page_title="Audio Transcription to Kiro Spec",
         page_icon="🎤",
-        layout="centered"
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
     
     # Main header with proper spacing
     st.title("🎤 Audio Transcription to Kiro Spec")
-    
-    # Show S3 bucket name at the top
+
+    # ---------- Sidebar: configuration ----------
     bucket_name = os.getenv('S3_BUCKET_NAME')
-    if bucket_name:
-        st.info(f"📦 **S3 Bucket:** `{bucket_name}`")
-    else:
-        st.warning("⚠️ **S3 Bucket:** Not configured (set S3_BUCKET_NAME environment variable)")
-    
-    # Model ID input section
-    st.subheader("🤖 Model ID")
-    
-    # Model ID text input with default value
-    selected_model_id = st.text_input(
-        "Bedrock Model ID:",
-        value=os.environ.get("BEDROCK_MODEL_ID", "eu.anthropic.claude-haiku-4-5-20251001-v1:0"),
-        help="Enter the Bedrock model ID to use for converting your transcript into structured requirements."
-    )
-    
-    st.markdown("---")
-    
+    github_token = os.getenv('GITHUB_TOKEN')
+    github_repo = os.getenv('GITHUB_REPO')
+    github_available = bool(github_token)
+
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+
+        # S3 bucket info
+        if bucket_name:
+            st.success(f"📦 **S3 Bucket**\n\n`{bucket_name}`")
+        else:
+            st.warning(
+                "⚠️ **S3 Bucket** not configured.\n\n"
+                "Set `S3_BUCKET_NAME` in your `.env`."
+            )
+
+        st.divider()
+
+        # Model ID
+        st.subheader("🤖 Model")
+        selected_model_id = st.text_input(
+            "Bedrock Model ID",
+            value=os.environ.get(
+                "BEDROCK_MODEL_ID",
+                "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+            ),
+            help="Bedrock model ID used to convert transcripts into "
+                 "requirements or GitHub issues.",
+        )
+
+        st.divider()
+
+        # Transcription engine
+        st.subheader("🗣️ Transcription Engine")
+        parakeet_ready = is_parakeet_available()
+        engine_labels = {
+            'aws': "☁️ Amazon Transcribe",
+            'parakeet': "🦜 Parakeet MLX (local, Apple Silicon)",
+        }
+        if parakeet_ready:
+            ordered_engines = ['aws', 'parakeet']
+            current_engine = st.session_state.transcription_engine
+            if current_engine not in ordered_engines:
+                current_engine = 'aws'
+            selected_engine_label = st.radio(
+                "Choose how to transcribe your audio:",
+                options=[engine_labels[k] for k in ordered_engines],
+                index=ordered_engines.index(current_engine),
+                help="Parakeet MLX runs fully on-device on Apple Silicon and "
+                     "skips the S3 upload + Amazon Transcribe round-trip.",
+            )
+            st.session_state.transcription_engine = next(
+                key for key, label in engine_labels.items()
+                if label == selected_engine_label
+            )
+            if st.session_state.transcription_engine == 'parakeet':
+                st.caption(f"Model: `{PARAKEET_DEFAULT_MODEL}`")
+        else:
+            # Force AWS when Parakeet is unavailable.
+            st.session_state.transcription_engine = 'aws'
+            st.caption(engine_labels['aws'])
+            st.caption(
+                "💡 To enable on-device transcription, run "
+                "`uv sync --extra local-transcribe` and make sure `ffmpeg` "
+                "is on PATH."
+            )
+
+        st.divider()
+
+        # Output mode
+        st.subheader("🎯 Output Mode")
+        if github_available:
+            mode_labels = {
+                'local': "📝 Local — generate requirements + tasks",
+                'github': "🐙 GitHub — open issue directly",
+            }
+            # Default radio index follows current session state (which itself
+            # defaults to 'github' when a token is configured).
+            current_mode = st.session_state.output_mode
+            ordered_keys = ['github', 'local']  # put the default-preferred option first
+            selected_label = st.radio(
+                "How should we handle the transcript?",
+                options=[mode_labels[k] for k in ordered_keys],
+                index=ordered_keys.index(current_mode),
+                help="GitHub mode skips the requirements/design/tasks pipeline "
+                     "and opens an issue in GITHUB_REPO.",
+            )
+            st.session_state.output_mode = next(
+                key for key, label in mode_labels.items() if label == selected_label
+            )
+
+            if st.session_state.output_mode == 'github':
+                if github_repo:
+                    st.info(f"🐙 **GitHub Repo**\n\n`{github_repo}`")
+                else:
+                    st.warning(
+                        "⚠️ `GITHUB_REPO` is not set.\n\n"
+                        "Use `owner/repo` format in your `.env`."
+                    )
+        else:
+            st.session_state.output_mode = 'local'
+            st.caption(
+                "💡 Set `GITHUB_TOKEN` (and `GITHUB_REPO`) in `.env` to enable "
+                "GitHub mode."
+            )
+
+    # ---------- Main area ----------
+
     # Description section
     st.markdown("""
     ### How it works:
@@ -340,8 +446,39 @@ def main():
     if st.session_state.processing_status == 'complete' and st.session_state.project_name:
         st.markdown("---")
         st.subheader("🎉 Success!")
-        
-        # Enhanced success messaging with detailed information
+
+        if st.session_state.output_mode == 'github' and st.session_state.github_issue:
+            issue = st.session_state.github_issue
+            st.success("✅ **GitHub issue created!**")
+            st.info(
+                f"**🐙 Repository:** `{os.getenv('GITHUB_REPO')}`\n\n"
+                f"**#:** `{issue['number']}`\n\n"
+                f"**🔗 URL:** {issue['html_url']}"
+            )
+            col1, col2 = st.columns(2)
+            with col1:
+                st.link_button(
+                    "🐙 Open Issue on GitHub",
+                    issue['html_url'],
+                    use_container_width=True,
+                )
+            with col2:
+                if st.button("🔄 New Recording", help="Start over with a new recording", use_container_width=True):
+                    reset_session_state()
+                    st.rerun()
+
+            # Skip the local-file success panel in GitHub mode.
+            st.markdown("<br><br>", unsafe_allow_html=True)
+            st.markdown("---")
+            st.markdown(
+                "<div style='text-align: center; color: #666;'>"
+                "Powered by Amazon Transcribe & Bedrock Claude Models"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            return
+
+        # Enhanced success messaging with detailed information (local mode)
         st.success("✅ **Project created successfully!**")
         
         # Project details in an attractive info box
@@ -465,87 +602,166 @@ def main():
     # Processing workflow - orchestrate the complete audio-to-spec pipeline
     if submit_button and audio_data is not None:
         try:
-            # Get required environment variables
             bucket_name = os.getenv('S3_BUCKET_NAME')
-            if not bucket_name:
-                st.session_state.error_message = "S3_BUCKET_NAME environment variable is not set"
+            engine = st.session_state.transcription_engine
+
+            # Audio bytes are the same regardless of engine.
+            if st.session_state.input_method in ('microphone', 'upload'):
+                audio_bytes = audio_data.getvalue()
+            else:
+                audio_bytes = audio_data.getvalue()
+
+            # Amazon Transcribe requires an S3 bucket; Parakeet doesn't.
+            if engine == 'aws' and not bucket_name:
+                st.session_state.error_message = (
+                    "S3_BUCKET_NAME is not set. Either configure it in your .env "
+                    "or switch to the Parakeet MLX engine in the sidebar."
+                )
                 st.session_state.processing_status = 'error'
                 st.rerun()
                 return
-            
-            # Step 1: Upload audio to S3 with loading state
-            st.session_state.processing_status = 'uploading'
-            
-            # Show upload progress immediately
-            with st.spinner("Uploading audio to cloud storage..."):
-                st.info("⏳ **Step 1/3:** Uploading your audio file to secure cloud storage")
-                
-                # Generate unique filename and upload to S3
-                filename = generate_unique_filename()
-                
-                # Handle both input methods - get audio bytes using utility function
-                if st.session_state.input_method == 'microphone':
-                    audio_bytes = audio_data.getvalue()
-                    st.write(f"🎙️ Processing microphone recording")
-                elif st.session_state.input_method == 'upload':
-                    audio_bytes = audio_data.getvalue()
-                    st.write(f"📁 Processing uploaded file")
-                else:
-                    # Fallback for direct audio_data
-                    audio_bytes = audio_data.getvalue()
-                    st.write(f"🎵 Processing audio input")
-                
-                s3_uri = upload_audio_to_s3(audio_bytes, bucket_name, filename)
-                st.write(f"✅ Upload successful")
-            
-            # Step 2: Start transcription job with enhanced progress tracking
-            st.session_state.processing_status = 'transcribing'
-            
-            with st.spinner("Starting transcription job..."):
-                st.info("🎯 **Step 2/3:** Converting speech to text using AI transcription")
-                
-                # Create unique job name based on filename
-                job_name = f"transcription_{filename.replace('.wav', '').replace('_', '-')}"
-                transcription_job_name = start_transcription_job(s3_uri, job_name)
-                st.session_state.transcription_job_name = transcription_job_name
-            
-            # Poll for transcription completion with progress tracking
-            with st.spinner("Transcribing your audio..."):
-                # Define progress callback for transcription polling
-                def update_transcription_progress(progress_info):
-                    st.session_state.transcription_progress = progress_info
-                
-                job_status = poll_transcription_status(transcription_job_name, update_transcription_progress)
-            
-            if job_status['TranscriptionJobStatus'] != 'COMPLETED':
-                error_reason = job_status.get('FailureReason', 'Unknown transcription failure')
-                st.session_state.error_message = f"Transcription failed: {error_reason}"
-                st.session_state.processing_status = 'error'
-                st.rerun()
-                return
-            
-            # Get transcription result
-            transcription_text = get_transcription_result(transcription_job_name)
-            st.session_state.transcription_text = transcription_text
-            
-            # Step 3: Generate specification using Bedrock with loading state
+
+            if engine == 'parakeet':
+                # Step 1/2: Transcribe locally with Parakeet MLX.
+                st.session_state.processing_status = 'transcribing'
+                with st.spinner("Transcribing locally with Parakeet MLX..."):
+                    st.info(
+                        "🦜 **Step 1/2:** Running Parakeet MLX on-device "
+                        "(first run downloads the model)"
+                    )
+                    transcription_text = transcribe_with_parakeet(audio_bytes)
+                    if not transcription_text:
+                        st.session_state.error_message = (
+                            "Parakeet returned an empty transcript. "
+                            "Check the audio quality or duration."
+                        )
+                        st.session_state.processing_status = 'error'
+                        st.rerun()
+                        return
+                    st.session_state.transcription_text = transcription_text
+                    st.write("✅ Local transcription complete")
+            else:
+                # Step 1/3: Upload audio to S3.
+                st.session_state.processing_status = 'uploading'
+                with st.spinner("Uploading audio to cloud storage..."):
+                    st.info(
+                        "⏳ **Step 1/3:** Uploading your audio file to secure "
+                        "cloud storage"
+                    )
+                    filename = generate_unique_filename()
+                    if st.session_state.input_method == 'microphone':
+                        st.write("🎙️ Processing microphone recording")
+                    elif st.session_state.input_method == 'upload':
+                        st.write("📁 Processing uploaded file")
+                    else:
+                        st.write("🎵 Processing audio input")
+
+                    s3_uri = upload_audio_to_s3(audio_bytes, bucket_name, filename)
+                    st.write("✅ Upload successful")
+
+                # Step 2/3: Start Amazon Transcribe job.
+                st.session_state.processing_status = 'transcribing'
+                with st.spinner("Starting transcription job..."):
+                    st.info(
+                        "🎯 **Step 2/3:** Converting speech to text using AI "
+                        "transcription"
+                    )
+                    job_name = (
+                        f"transcription_{filename.replace('.wav', '').replace('_', '-')}"
+                    )
+                    transcription_job_name = start_transcription_job(s3_uri, job_name)
+                    st.session_state.transcription_job_name = transcription_job_name
+
+                with st.spinner("Transcribing your audio..."):
+                    def update_transcription_progress(progress_info):
+                        st.session_state.transcription_progress = progress_info
+
+                    job_status = poll_transcription_status(
+                        transcription_job_name, update_transcription_progress
+                    )
+
+                if job_status['TranscriptionJobStatus'] != 'COMPLETED':
+                    error_reason = job_status.get(
+                        'FailureReason', 'Unknown transcription failure'
+                    )
+                    st.session_state.error_message = (
+                        f"Transcription failed: {error_reason}"
+                    )
+                    st.session_state.processing_status = 'error'
+                    st.rerun()
+                    return
+
+                # Get transcription result from Amazon Transcribe output.
+                transcription_text = get_transcription_result(transcription_job_name)
+                st.session_state.transcription_text = transcription_text
+
+            # Step 3: Generate output based on selected mode
             st.session_state.processing_status = 'generating'
-            
-            with st.spinner("Generating Kiro specification..."):
-                st.info("✨ **Step 3/3:** Creating structured requirements document")
-                
-                spec_content, project_name = convert_transcript_to_spec(transcription_text, selected_model_id)
-                st.session_state.project_name = project_name
-                
-                # Generate tasks from the spec
-                tasks_content = generate_tasks_from_spec(spec_content, selected_model_id)
-                
-                # Step 4: Create local project folder and save requirements.md and tasks.md
-                create_project_folder(project_name, spec_content, tasks_content)
-                
-                # Step 5: Upload requirements.md to S3
-                s3_requirements_uri = upload_requirements_to_s3(bucket_name, project_name, spec_content)
-                st.write(f"✅ Requirements uploaded to S3: {s3_requirements_uri}")
+
+            if st.session_state.output_mode == 'github':
+                # GitHub mode: skip requirements/design/tasks docs and create an issue directly.
+                repo = os.getenv('GITHUB_REPO')
+                token = os.getenv('GITHUB_TOKEN')
+
+                if not token:
+                    st.session_state.error_message = (
+                        "GITHUB_TOKEN is not set. Add it to your .env to use GitHub mode."
+                    )
+                    st.session_state.processing_status = 'error'
+                    st.rerun()
+                    return
+                if not repo:
+                    st.session_state.error_message = (
+                        "GITHUB_REPO is not set. Use the format 'owner/repo' in your .env."
+                    )
+                    st.session_state.processing_status = 'error'
+                    st.rerun()
+                    return
+
+                with st.spinner("Creating GitHub issue..."):
+                    st.info("✨ **Step 3/3:** Generating a GitHub issue from your transcript")
+
+                    title, body = convert_transcript_to_github_issue(
+                        transcription_text, selected_model_id
+                    )
+                    issue = create_github_issue(
+                        repo=repo,
+                        title=title,
+                        body=body,
+                        token=token,
+                        labels=["kiro"],
+                    )
+                    st.session_state.github_issue = issue
+                    # Use the issue title as a stand-in project name for the success panel.
+                    st.session_state.project_name = f"GitHub issue #{issue['number']}"
+                    st.write(f"✅ Issue created: {issue['html_url']}")
+            else:
+                # Local mode: existing requirements + tasks pipeline.
+                with st.spinner("Generating Kiro specification..."):
+                    st.info("✨ **Step 3/3:** Creating structured requirements document")
+
+                    spec_content, project_name = convert_transcript_to_spec(
+                        transcription_text, selected_model_id
+                    )
+                    st.session_state.project_name = project_name
+
+                    # Generate tasks from the spec
+                    tasks_content = generate_tasks_from_spec(spec_content, selected_model_id)
+
+                    # Step 4: Create local project folder and save requirements.md and tasks.md
+                    create_project_folder(project_name, spec_content, tasks_content)
+
+                    # Step 5: Upload requirements.md to S3 (if a bucket is configured)
+                    if bucket_name:
+                        s3_requirements_uri = upload_requirements_to_s3(
+                            bucket_name, project_name, spec_content
+                        )
+                        st.write(f"✅ Requirements uploaded to S3: {s3_requirements_uri}")
+                    else:
+                        st.caption(
+                            "ℹ️ Skipped S3 upload of requirements.md "
+                            "(no S3_BUCKET_NAME configured)."
+                        )
             
             # Mark as complete
             st.session_state.processing_status = 'complete'

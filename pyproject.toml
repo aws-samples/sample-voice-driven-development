@@ -10,3 +10,12 @@ dependencies = [
     "pytest>=8.4.1",
     "python-dotenv>=1.2.2",
 ]
+
+[project.optional-dependencies]
+# Enables the Parakeet MLX local transcription engine (Apple Silicon only).
+# Install with: `uv sync --extra local-transcribe`
+# or: `pip install -e ".[local-transcribe]"`.
+# Requires `ffmpeg` on PATH for audio preprocessing.
+local-transcribe = [
+    "parakeet-mlx @ git+https://github.com/senstella/parakeet-mlx.git@master",
+]
