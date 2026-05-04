@@ -10,6 +10,8 @@ import boto3
 import json
 import os
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime
 from typing import Tuple
 from botocore.exceptions import ClientError
@@ -24,6 +26,39 @@ def generate_unique_filename() -> str:
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     return f"audio_recording_{timestamp}.wav"
+
+
+def resolve_bedrock_region(model_id: str) -> str:
+    """
+    Resolve the AWS region to use for a Bedrock model ID.
+
+    Bedrock cross-region inference profiles are namespaced by geography:
+    - "us.*" profiles live in US regions (we use us-east-1)
+    - "eu.*" profiles live in EU regions (we use eu-west-1)
+    - "apac.*" profiles live in APAC regions (we use ap-northeast-1)
+
+    An explicit AWS_REGION env var always wins.
+
+    Args:
+        model_id: Bedrock model ID or inference profile ID.
+
+    Returns:
+        AWS region string suitable for boto3 clients.
+    """
+    explicit = os.environ.get("AWS_REGION") or os.environ.get("BEDROCK_REGION")
+    if explicit:
+        return explicit
+
+    if not model_id:
+        return "us-east-1"
+
+    prefix = model_id.split(".", 1)[0].lower()
+    if prefix == "eu":
+        return "eu-west-1"
+    if prefix == "apac":
+        return "ap-northeast-1"
+    # "us" and anything else falls back to us-east-1.
+    return "us-east-1"
 
 
 def process_audio_input(recorded_audio, uploaded_file) -> bytes:
@@ -501,8 +536,10 @@ def convert_transcript_to_spec(transcript: str, model_id: str = None) -> Tuple[s
     
     for attempt in range(max_retries + 1):
         try:
-            # Initialize Bedrock Runtime client with hardcoded region
-            bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
+            # Initialize Bedrock Runtime client in the region that matches the model ID
+            bedrock_client = boto3.client(
+                'bedrock-runtime', region_name=resolve_bedrock_region(model_id)
+            )
             
             # Create prompt template for converting transcript to Kiro spec format
             prompt_template = """You are an expert software requirements analyst. Your task is to convert the following spoken requirements transcript into a detailed Kiro specs-driven development format.
@@ -678,7 +715,9 @@ def generate_tasks_from_spec(spec_content: str, model_id: str = None) -> str:
     if not spec_content or not spec_content.strip():
         raise ValueError("Specification content cannot be empty")
 
-    bedrock_client = boto3.client('bedrock-runtime')
+    bedrock_client = boto3.client(
+        'bedrock-runtime', region_name=resolve_bedrock_region(model_id)
+    )
 
     prompt = f"""You are an expert software engineer. Given the following requirements specification, generate a detailed tasks.md file that an AI coding agent can follow to implement the project and satisfy all acceptance criteria.
 
@@ -877,3 +916,295 @@ def create_project_folder(project_name: str, spec_content: str, tasks_content: s
         raise Exception(f"Failed to write specification content due to encoding error: {str(e)}")
     except Exception as e:
         raise Exception(f"Unexpected error creating project folder '{project_name}' under projects directory: {str(e)}")
+
+
+def convert_transcript_to_github_issue(transcript: str, model_id: str = None) -> Tuple[str, str]:
+    """
+    Use Bedrock Claude to convert a transcript directly into a GitHub issue
+    (title + body). This skips the full requirements/design/tasks pipeline and
+    produces a single actionable task suitable for tracking on GitHub.
+
+    Args:
+        transcript: Transcribed text from the audio input
+        model_id: Bedrock model ID to use (defaults to env BEDROCK_MODEL_ID)
+
+    Returns:
+        Tuple of (title, body) for the GitHub issue.
+
+    Raises:
+        ValueError: If transcript is empty or the model response is malformed.
+        ClientError: If the Bedrock API call fails.
+    """
+    if model_id is None:
+        model_id = os.environ.get(
+            "BEDROCK_MODEL_ID",
+            "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+        )
+
+    if not transcript or not transcript.strip():
+        raise ValueError("Transcript cannot be empty")
+
+    bedrock_client = boto3.client(
+        'bedrock-runtime', region_name=resolve_bedrock_region(model_id)
+    )
+
+    prompt = f"""You are turning a spoken product request into a single actionable GitHub issue.
+
+Skip any formal requirements or design documents. Produce a concise, implementation-ready task.
+
+The issue body (markdown) should contain:
+- A short "## Summary" paragraph describing the goal.
+- A "## Acceptance Criteria" section with a bulleted checklist (- [ ] items).
+- An optional "## Notes" section only if the transcript mentions constraints, dependencies, or out-of-scope items.
+
+Keep the title under 80 characters, imperative mood, no trailing punctuation.
+
+Respond with ONLY valid JSON in this exact shape:
+{{
+    "title": "Short imperative title",
+    "body": "Markdown body here"
+}}
+
+TRANSCRIPT:
+{transcript}
+"""
+
+    response = bedrock_client.converse(
+        modelId=model_id,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": 2000, "temperature": 0.1},
+    )
+
+    response_text = response['output']['message']['content'][0]['text']
+
+    # Tolerate models that wrap JSON in prose.
+    json_start = response_text.find('{')
+    json_end = response_text.rfind('}') + 1
+    if json_start == -1 or json_end == 0:
+        raise ValueError("No JSON content found in Bedrock response for GitHub issue")
+
+    parsed = json.loads(response_text[json_start:json_end])
+
+    title = (parsed.get('title') or '').strip()
+    body = (parsed.get('body') or '').strip()
+
+    if not title:
+        raise ValueError("Bedrock response missing 'title' for GitHub issue")
+    if not body:
+        raise ValueError("Bedrock response missing 'body' for GitHub issue")
+
+    return title, body
+
+
+def create_github_issue(
+    repo: str,
+    title: str,
+    body: str,
+    token: str,
+    labels: list = None,
+) -> dict:
+    """
+    Create a GitHub issue in the given repository using the REST API.
+
+    Args:
+        repo: Repository in "owner/repo" format.
+        title: Issue title.
+        body: Issue body (markdown).
+        token: GitHub personal access token with issue write permission.
+        labels: Optional list of label names to apply.
+
+    Returns:
+        Dict with keys: number, html_url, api_url.
+
+    Raises:
+        ValueError: If required parameters are missing or malformed.
+        RuntimeError: If the GitHub API returns a non-success response.
+    """
+    if not repo or '/' not in repo:
+        raise ValueError("GitHub repo must be in 'owner/repo' format")
+    if not title or not title.strip():
+        raise ValueError("Issue title cannot be empty")
+    if not body or not body.strip():
+        raise ValueError("Issue body cannot be empty")
+    if not token:
+        raise ValueError("GitHub token is required")
+
+    url = f"https://api.github.com/repos/{repo}/issues"
+    payload = {"title": title.strip(), "body": body.strip()}
+    if labels:
+        payload["labels"] = labels
+
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "voice-driven-development",
+            "Content-Type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_body = response.read().decode("utf-8")
+            issue = json.loads(response_body)
+            return {
+                "number": issue.get("number"),
+                "html_url": issue.get("html_url"),
+                "api_url": issue.get("url"),
+            }
+    except urllib.error.HTTPError as e:
+        # Surface the GitHub error details to make debugging easier.
+        try:
+            error_body = e.read().decode("utf-8")
+        except Exception:
+            error_body = ""
+        raise RuntimeError(
+            f"GitHub API error {e.code} {e.reason} while creating issue in '{repo}': {error_body}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error calling GitHub API: {e.reason}") from e
+
+
+# --------------------------------------------------------------------------- #
+# Local transcription engine: Parakeet MLX (Apple Silicon)
+# --------------------------------------------------------------------------- #
+
+PARAKEET_DEFAULT_MODEL = os.environ.get(
+    "PARAKEET_MODEL_ID", "mlx-community/parakeet-tdt-0.6b-v2"
+)
+
+
+def is_parakeet_available() -> bool:
+    """
+    Return True when the Parakeet MLX engine can be used on this host.
+
+    Requires:
+    - `parakeet_mlx` importable (install via `uv sync --extra local-transcribe`).
+    - `ffmpeg` available on PATH for audio preprocessing.
+    """
+    try:
+        import importlib.util
+        if importlib.util.find_spec("parakeet_mlx") is None:
+            return False
+    except Exception:
+        return False
+
+    import shutil
+    return shutil.which("ffmpeg") is not None
+
+
+def _load_parakeet_model(model_id: str):
+    """Lazily load and cache the Parakeet model on first use."""
+    import functools
+
+    @functools.lru_cache(maxsize=2)
+    def _cached(mid: str):
+        from parakeet_mlx import from_pretrained
+        return from_pretrained(mid)
+
+    # Stash the cache on the module so repeated calls reuse it across reruns.
+    global _PARAKEET_CACHE
+    try:
+        _PARAKEET_CACHE
+    except NameError:
+        _PARAKEET_CACHE = _cached
+    return _PARAKEET_CACHE(model_id)
+
+
+def transcribe_with_parakeet(
+    audio_bytes: bytes,
+    model_id: str = None,
+    chunk_duration: float = 120.0,
+    overlap_duration: float = 15.0,
+) -> str:
+    """
+    Transcribe audio bytes locally using Parakeet MLX.
+
+    The input may be in any format ffmpeg can read (WAV, WebM/Opus from the
+    browser recorder, MP3, etc.). It is normalized to 16 kHz mono PCM WAV
+    before transcription, matching the reference example's pipeline.
+
+    Args:
+        audio_bytes: Raw audio bytes from either the file uploader or
+                     st.audio_input.
+        model_id: Parakeet model ID on Hugging Face. Defaults to the
+                  TDT 0.6B v2 community checkpoint.
+        chunk_duration: Seconds per chunk for long-form transcription.
+        overlap_duration: Overlap between chunks to preserve continuity.
+
+    Returns:
+        The transcript as plain text (whitespace-stripped).
+
+    Raises:
+        ValueError: If audio_bytes is empty.
+        RuntimeError: If parakeet_mlx / ffmpeg are unavailable or fail.
+    """
+    if not audio_bytes:
+        raise ValueError("Audio data cannot be empty")
+
+    if not is_parakeet_available():
+        raise RuntimeError(
+            "Parakeet MLX is not available. Install with "
+            "`uv sync --extra local-transcribe` and ensure `ffmpeg` is on PATH."
+        )
+
+    import shutil
+    import subprocess
+    import tempfile
+
+    target_model = model_id or PARAKEET_DEFAULT_MODEL
+
+    src_file = None
+    wav_file = None
+    try:
+        # Persist the incoming bytes so ffmpeg can read them from disk.
+        src_file = tempfile.NamedTemporaryFile(suffix=".audio", delete=False)
+        src_file.write(audio_bytes)
+        src_file.close()
+
+        wav_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        wav_file.close()
+
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-i", src_file.name,
+                    "-vn",
+                    "-acodec", "pcm_s16le",
+                    "-ar", "16000",
+                    "-ac", "1",
+                    "-y",
+                    wav_file.name,
+                ],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or b"").decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"ffmpeg failed to prepare audio for Parakeet: {stderr.strip()}"
+            ) from e
+
+        model = _load_parakeet_model(target_model)
+        result = model.transcribe(
+            wav_file.name,
+            chunk_duration=chunk_duration,
+            overlap_duration=overlap_duration,
+        )
+        return (result.text or "").strip()
+    finally:
+        for f in (src_file, wav_file):
+            if f is None:
+                continue
+            try:
+                path = f.name
+                if os.path.exists(path):
+                    os.unlink(path)
+            except OSError:
+                pass
