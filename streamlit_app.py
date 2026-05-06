@@ -80,14 +80,14 @@ def main():
     
     # Page configuration and header
     st.set_page_config(
-        page_title="Audio Transcription to Kiro Spec",
+        page_title="Voice Driven Development with Kiro Autonomous Agents",
         page_icon="🎤",
         layout="wide",
         initial_sidebar_state="expanded",
     )
     
     # Main header with proper spacing
-    st.title("🎤 Audio Transcription to Kiro Spec")
+    st.title("🎤 Voice Driven Development with Kiro Autonomous Agents")
 
     # ---------- Sidebar: configuration ----------
     bucket_name = os.getenv('S3_BUCKET_NAME')
@@ -97,17 +97,6 @@ def main():
 
     with st.sidebar:
         st.header("⚙️ Configuration")
-
-        # S3 bucket info
-        if bucket_name:
-            st.success(f"📦 **S3 Bucket**\n\n`{bucket_name}`")
-        else:
-            st.warning(
-                "⚠️ **S3 Bucket** not configured.\n\n"
-                "Set `S3_BUCKET_NAME` in your `.env`."
-            )
-
-        st.divider()
 
         # Model ID
         st.subheader("🤖 Model")
@@ -181,21 +170,22 @@ def main():
             st.session_state.output_mode = next(
                 key for key, label in mode_labels.items() if label == selected_label
             )
-
-            if st.session_state.output_mode == 'github':
-                if github_repo:
-                    st.info(f"🐙 **GitHub Repo**\n\n`{github_repo}`")
-                else:
-                    st.warning(
-                        "⚠️ `GITHUB_REPO` is not set.\n\n"
-                        "Use `owner/repo` format in your `.env`."
-                    )
         else:
             st.session_state.output_mode = 'local'
             st.caption(
                 "💡 Set `GITHUB_TOKEN` (and `GITHUB_REPO`) in `.env` to enable "
                 "GitHub mode."
             )
+
+        st.divider()
+
+        # QR code for GitHub repo
+        st.subheader("📱 GitHub Repo")
+        qr_path = os.path.join(os.path.dirname(__file__), "img", "qr-code.png")
+        if os.path.exists(qr_path):
+            st.image(qr_path, caption="Scan to visit the project Github repository", width=180)
+        else:
+            st.caption("QR code not found at img/qr-code.png")
 
     # ---------- Main area ----------
 
@@ -208,10 +198,6 @@ def main():
     """)
     
     st.markdown("---")
-    
-    # Audio input section with dual options
-    st.subheader("🎤 Provide Your Requirements")
-    st.write("Choose one of the following methods to provide your project requirements:")
     
     # Create tabs for input method selection
     tab1, tab2 = st.tabs(["🎙️ Record Audio", "📁 Upload File"])
@@ -294,10 +280,6 @@ def main():
             type="primary",
             help="Process your audio input to generate Kiro specification" if has_audio else "Please provide audio input first"
         )
-        
-        # Show status message when no audio is provided
-        if not has_audio and not is_processing:
-            st.caption("⚠️ Please record audio or upload a .wav file to continue")
     
     # Reset button for new recording
     if st.session_state.processing_status in ['complete', 'error']:
@@ -451,9 +433,7 @@ def main():
             issue = st.session_state.github_issue
             st.success("✅ **GitHub issue created!**")
             st.info(
-                f"**🐙 Repository:** `{os.getenv('GITHUB_REPO')}`\n\n"
-                f"**#:** `{issue['number']}`\n\n"
-                f"**🔗 URL:** {issue['html_url']}"
+                f"**� URL:** {issue['html_url']}"
             )
             col1, col2 = st.columns(2)
             with col1:
